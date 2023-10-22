@@ -50,7 +50,7 @@ This Python ETL pipeline extracts financial data from a source S3 bucket, perfor
 
 2. Run the ETL script:
    ```sh
-   Python ETL Connecting to Multiple files from S3 bucket Quick and Dirty.py
+   Python Script.py
    
 4. Processed data will be stored in the target S3 bucket in Parquet format.
 
