@@ -1,255 +1,2173 @@
-#!/usr/bin/env python
-# coding: utf-8
-
-# In[1]:
-
-
-"""This script imports necessary libraries for data processing and AWS S3 interaction.
-
-- pandas (pd): Used for data manipulation and analysis.
-- numpy (np): Used for advanced numerical operations and arrays.
-- boto3: Provides an interface to interact with Amazon Web Services (AWS), including Amazon S3.
-- StringIO: A module for working with in-memory string buffers, often used for reading data from or writing data to strings.
-"""
-import boto3
-import pandas as pd
-import numpy as np
-from io import StringIO, BytesIO
-from datetime import datetime, timedelta
-
-
-# In[2]:
-
-
-s3 = boto3.resource('s3')
-
-# Connecting to source S3 bucket
-bucket = s3.Bucket('xetra-1234')
-
-
-# In[3]:
-
-
-# Setting an argument date from which we need data into our dataframe "2022-12-25" in our case
-arg_date = '2022-12-25'
-
-# To get the data of previous day's closing price we will need to fetch data from 2022-12-24
-arg_date_datetime = datetime.strptime(arg_date, '%Y-%m-%d').date() - timedelta(days =1)
-arg_date_datetime
-
-
-# In[4]:
-
-
-# Getting a list of all the objects/files inside S3 bucket
-objects = [obj for obj in bucket.objects.all() if datetime.strptime(obj.key.split('/')[0], '%Y-%m-%d').date() >= arg_date_datetime]
-
-
-# In[5]:
-
-
-# We can see that list objects now contain details of all the files 
-objects
-
-
-# * we can see that "objects" now contains the list of all the files available inside the S3 Bucket named "xetra-1234" from date "2022-01-03" onwards
-
-# In[6]:
-
-
-# Lets get a list of column names of the data
-csv_obj_init = bucket.Object(key = objects[0].key).get().get('Body').read().decode('utf-8')
-data_init = StringIO(csv_obj_init)
-df_init = pd.read_csv(data_init, delimiter = ',')
-
-
-# In[7]:
-
-
-# chechking the culumn names in dataframe
-df_init.columns
-
-
-# In[8]:
-
-
-import warnings
-
-# Filter out a specific warning
-warnings.filterwarnings("ignore", category=FutureWarning)
-
-# Creating an empty pandas dataframe and fixing the column names as per our dataset
-df_merged = pd.DataFrame(columns=df_init.columns)
-
-# Merging the data present in all the csv files into a single merged Dataset called df_merged using a for loop
-for obj in objects:
-    csv_obj = bucket.Object(key=obj.key).get().get('Body').read().decode('utf-8')
-    data = StringIO(csv_obj)
-    df = pd.read_csv(data, delimiter=',')
-    df_merged = pd.concat([df_merged, df], ignore_index=True)
-
-
-# In[9]:
-
-
-df_merged
-
-
-# In[10]:
-
-
-# There are many columns which we do not need for further processing lets get rid of unwanted data
-columns_to_included = ['ISIN', 'Date', 'Time', 'StartPrice', 'MaxPrice', 'MinPrice',
-       'EndPrice', 'TradedVolume']
-
-
-# In[11]:
-
-
-# Filtering our merged dataframe to only those columns which we need for further process
-df_merged = df_merged.loc[:,columns_to_included]
-df_merged
-
-
-# * df_merged now containes only those columns which we need for further analysis
-
-# In[12]:
-
-
-# Lets check our dataset for any Null Values
-df_merged.isna().sum()
-
-
-# ## Data Transformation
-
-# In[13]:
-
-
-# Lets check the dataframe to see whether we have any opening_price for the day
-df_merged[(df_merged['ISIN'] == 'AT0000A0E9W5') & (df_merged['Date']== '2022-12-25')].sort_values(['Time'])
-
-
-# * We can see that there is no column which provides us details about the opening price for a particular date
-# * Now in the next steps we will create a few columns like opening_price, closing_price etc, which will be a part of our data transformation process.
-
-# ### Get Opening price per ISIN per day
-
-# In[14]:
-
-
-# Creating a new column opening_price, which will be equal to the first reported StartPrice per ISIN per Day
-df_merged['opening_price'] = df_merged.sort_values(['Time']).groupby(['ISIN', 'Date'])['StartPrice'].transform('first')
-df_merged[(df_merged['ISIN'] == 'AT0000A0E9W5')]
-
-
-# * Now we have a column which shows the opening price per ISIN per day.
-# * We will now create some more columns in the same fashion which are needed for further analysis
-
-# ### Get Closing price per ISIN per day
-
-# In[15]:
-
-
-# Creating a new column named closing_price
-df_merged['closing_price'] = df_merged.sort_values(['Time']).groupby(['ISIN', 'Date'])['EndPrice'].transform('last')
-df_merged[(df_merged['ISIN'] == 'AT0000A0E9W5')]
-
-
-# ### Aggregations
-
-# In[16]:
-
-
-df_merged = df_merged.groupby(['ISIN', 'Date'], as_index=False).agg(opening_price_eur=('opening_price', 'min'), closing_price_eur = ('closing_price', 'min'), mimimum_price_eur = ('MinPrice','min'), maximum_price_eur = ('MaxPrice','max'), daily_traded_volume =('TradedVolume','sum'))
-
-
-# In[17]:
-
-
-df_merged
-
-
-# * After the above transformations we have:
-#     1. Opening Price Column for the day
-#     2. Closing price column for the day
-#     3. maximum price column for the day
-#     4. minimum price column for the day
-#     5. all the above columns show amount in Euros
-#     6. Daily traded volumn for a particular stock for a particular day 
-
-# ### Percent change previous closing
-
-# In[18]:
-
-
-# creating a new column previous_closiong_price and assigning the value of closing_price_eur column of previous day
-df_merged['previous_closing_price'] = df_merged.sort_values(['Date']).groupby(['ISIN'])['closing_price_eur'].shift(1)
-
-# Calculating precent change from previous day's closing price
-df_merged['change_in_closing_in_%'] = round((df_merged['closing_price_eur'] - df_merged['previous_closing_price'])/df_merged['previous_closing_price']*100,2)
-
-# Dropping column previous_closing_price as it is no longer needed
-df_merged.drop(columns = ['previous_closing_price'], inplace = True)
-
-# Lets round every number to upto two decimals
-df_merged = df_merged.round(decimals = 2)
-df_merged
-
-
-# ### Write the combined and aggregated dataset to a target S3 Bucket
-
-# In[19]:
-
-
-# Describing the name of the key for output parquet file
-key = 'xetra_daily_report' + datetime.today().strftime("%Y%m%d_%H%M%S")+'.parquet'
-
-
-# In[21]:
-
-
-# Creating an in-memory buffer using BytesIO
-out_buffer = BytesIO()
-
-# Writing the DataFrame (df_merged) to the in-memory buffer in Parquet format
-# with index=False (no index column in the Parquet file)
-df_merged.to_parquet(out_buffer, index=False)
-
-# Creating an S3 bucket object by specifying the bucket name
-bucket_target = s3.Bucket('xetra-1234-etl-target-bucket')
-
-# Uploading the Parquet data (from the in-memory buffer) to the S3 bucket
-# by getting the buffer's content with getvalue() and specifying the key
-bucket_target.put_object(Body=out_buffer.getvalue(), Key=key)
-
-
-# ### Reading the uploaded file to check whether the file content is correct
-
-# In[23]:
-
-
-# reading the name of parquet file from S3 bucket
-for obj in bucket_target.objects.all():
-    print (obj.key)
-
-
-# In[25]:
-
-
-# Getting the S3 object ('prq_obj') from the specified S3 bucket ('bucket_target')
-# The object key is set to 'xetra_daily_report20231022_204256.parquet'
-# The object is retrieved from S3 and its body is read as bytes
-prq_obj = bucket_target.Object(key='xetra_daily_report20231022_204256.parquet').get().get('Body').read()
-
-# Create a BytesIO object ('data') and load the Parquet data ('prq_obj') into it
-data = BytesIO(prq_obj)
-
-# Read the Parquet data from the BytesIO object into a pandas DataFrame ('df_report')
-df_report = pd.read_parquet(data)
-
-
-# In[ ]:
-
-
-
-
+{
+ "cells": [
+  {
+   "cell_type": "code",
+   "execution_count": 28,
+   "id": "9b9ce608-39a0-489f-9d53-0d767c83890e",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "\"\"\"This script imports necessary libraries for data processing and AWS S3 interaction.\n",
+    "\n",
+    "- pandas (pd): Used for data manipulation and analysis.\n",
+    "- numpy (np): Used for advanced numerical operations and arrays.\n",
+    "- boto3: Provides an interface to interact with Amazon Web Services (AWS), including Amazon S3.\n",
+    "- StringIO: A module for working with in-memory string buffers, often used for reading data from or writing data to strings.\n",
+    "\"\"\"\n",
+    "import boto3\n",
+    "import pandas as pd\n",
+    "import numpy as np\n",
+    "from io import StringIO, BytesIO\n",
+    "from datetime import datetime, timedelta"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 29,
+   "id": "2606a7e5-ca79-4966-ab10-abeed4eeccc3",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# Setting an argument date from which we need data into our dataframe \"2022-12-25\" in our case\n",
+    "arg_date = '2022-12-25'\n",
+    "\n",
+    "# Setting source format of date\n",
+    "src_format = '%Y-%m-%d'\n",
+    "\n",
+    "# setting source bucket name\n",
+    "src_bucket = 'xetra-1234'\n",
+    "\n",
+    "# Setting target bucket\n",
+    "trg_bucket = 'xetra-1234-etl-target-bucket'\n",
+    "\n",
+    "# There are many columns which we do not need for further processing lets get rid of unwanted data\n",
+    "columns_to_included = ['ISIN', 'Date', 'Time', 'StartPrice', 'MaxPrice', 'MinPrice','EndPrice', 'TradedVolume']\n",
+    "\n",
+    "# Describing the name of the key for output parquet file\n",
+    "key = 'xetra_daily_report' + datetime.today().strftime(\"%Y%m%d_%H%M%S\")+'.parquet'"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 30,
+   "id": "4254bdd4-4b73-44f4-a05a-7166d8bd7b3e",
+   "metadata": {},
+   "outputs": [
+    {
+     "data": {
+      "text/plain": [
+       "datetime.date(2022, 12, 24)"
+      ]
+     },
+     "execution_count": 30,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "# We need data from 2022-12-25 but to calculate the percent change from previous day we will collect data from 2022-12-24\n",
+    "# To get the data of previous day's closing price we will need to fetch data from 2022-12-24\n",
+    "arg_date_datetime = datetime.strptime(arg_date, src_format).date() - timedelta(days =1)\n",
+    "arg_date_datetime"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 31,
+   "id": "871714cb-f311-4685-8ae7-b86ad7374321",
+   "metadata": {},
+   "outputs": [
+    {
+     "data": {
+      "text/plain": [
+       "185"
+      ]
+     },
+     "execution_count": 31,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "s3 = boto3.resource('s3')\n",
+    "\n",
+    "# Connecting to source S3 bucket\n",
+    "bucket = s3.Bucket(src_bucket)\n",
+    "\n",
+    "# Getting a list of all the objects/files inside S3 bucket\n",
+    "objects = [obj for obj in bucket.objects.all() if datetime.strptime(obj.key.split('/')[0], src_format).date() >= arg_date_datetime]\n",
+    "len(objects)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 32,
+   "id": "54f8dc06-1f6d-4e1e-b1fd-bb083ba0a24f",
+   "metadata": {
+    "scrolled": true
+   },
+   "outputs": [
+    {
+     "data": {
+      "text/plain": [
+       "[s3.ObjectSummary(bucket_name='xetra-1234', key='2022-12-24/2022-12-24_BINS_XETR00.csv'),\n",
+       " s3.ObjectSummary(bucket_name='xetra-1234', key='2022-12-24/2022-12-24_BINS_XETR01.csv'),\n",
+       " s3.ObjectSummary(bucket_name='xetra-1234', key='2022-12-24/2022-12-24_BINS_XETR02.csv'),\n",
+       " s3.ObjectSummary(bucket_name='xetra-1234', key='2022-12-24/2022-12-24_BINS_XETR03.csv'),\n",
+       " s3.ObjectSummary(bucket_name='xetra-1234', key='2022-12-24/2022-12-24_BINS_XETR04.csv'),\n",
+       " s3.ObjectSummary(bucket_name='xetra-1234', key='2022-12-24/2022-12-24_BINS_XETR05.csv'),\n",
+       " s3.ObjectSummary(bucket_name='xetra-1234', key='2022-12-24/2022-12-24_BINS_XETR06.csv'),\n",
+       " s3.ObjectSummary(bucket_name='xetra-1234', key='2022-12-24/2022-12-24_BINS_XETR07.csv'),\n",
+       " s3.ObjectSummary(bucket_name='xetra-1234', key='2022-12-24/2022-12-24_BINS_XETR08.csv'),\n",
+       " s3.ObjectSummary(bucket_name='xetra-1234', key='2022-12-24/2022-12-24_BINS_XETR09.csv')]"
+      ]
+     },
+     "execution_count": 32,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "# We can see that list objects now contain details of all the files \n",
+    "objects[:10]"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "c1b336ea-77ee-48b0-a3ef-c61838e2ff23",
+   "metadata": {},
+   "source": [
+    "* we can see that \"objects\" now contains the list of all the files available inside the S3 Bucket named \"xetra-1234\" from date \"2022-01-03\" onwards"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 33,
+   "id": "07efb25c-28e4-49eb-9e1c-95f05e200076",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# Defining a function to fetch each csv file from bucket and converting the same \n",
+    "# to a df\n",
+    "def csv_to_df (filename):\n",
+    "    csv_obj = bucket.Object(key=filename).get().get('Body').read().decode('utf-8')\n",
+    "    data = StringIO(csv_obj)\n",
+    "    df = pd.read_csv(data, delimiter=',')\n",
+    "    return df\n",
+    "\n",
+    "# Using list comprehension with pd.concat function to merge all the data of required csv files\n",
+    "df_merged = pd.concat([csv_to_df(obj.key) for obj in objects], ignore_index = True)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 34,
+   "id": "10ff89cf-1cb9-4a7d-8d8d-6ec54f312c7e",
+   "metadata": {},
+   "outputs": [
+    {
+     "data": {
+      "text/html": [
+       "<div>\n",
+       "<style scoped>\n",
+       "    .dataframe tbody tr th:only-of-type {\n",
+       "        vertical-align: middle;\n",
+       "    }\n",
+       "\n",
+       "    .dataframe tbody tr th {\n",
+       "        vertical-align: top;\n",
+       "    }\n",
+       "\n",
+       "    .dataframe thead th {\n",
+       "        text-align: right;\n",
+       "    }\n",
+       "</style>\n",
+       "<table border=\"1\" class=\"dataframe\">\n",
+       "  <thead>\n",
+       "    <tr style=\"text-align: right;\">\n",
+       "      <th></th>\n",
+       "      <th>ISIN</th>\n",
+       "      <th>Mnemonic</th>\n",
+       "      <th>SecurityDesc</th>\n",
+       "      <th>SecurityType</th>\n",
+       "      <th>Currency</th>\n",
+       "      <th>SecurityID</th>\n",
+       "      <th>Date</th>\n",
+       "      <th>Time</th>\n",
+       "      <th>StartPrice</th>\n",
+       "      <th>MaxPrice</th>\n",
+       "      <th>MinPrice</th>\n",
+       "      <th>EndPrice</th>\n",
+       "      <th>TradedVolume</th>\n",
+       "      <th>NumberOfTrades</th>\n",
+       "    </tr>\n",
+       "  </thead>\n",
+       "  <tbody>\n",
+       "    <tr>\n",
+       "      <th>0</th>\n",
+       "      <td>DE000A1J5RX9</td>\n",
+       "      <td>O2D</td>\n",
+       "      <td>TELEFONICA DTLD HLDG NA</td>\n",
+       "      <td>Common stock</td>\n",
+       "      <td>EUR</td>\n",
+       "      <td>2504492</td>\n",
+       "      <td>2022-12-24</td>\n",
+       "      <td>08:00</td>\n",
+       "      <td>2.433</td>\n",
+       "      <td>2.444</td>\n",
+       "      <td>2.433</td>\n",
+       "      <td>2.438</td>\n",
+       "      <td>183342</td>\n",
+       "      <td>14</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>1</th>\n",
+       "      <td>DE000A13SX22</td>\n",
+       "      <td>HLE</td>\n",
+       "      <td>HELLA GMBH+CO. KGAA O.N.</td>\n",
+       "      <td>Common stock</td>\n",
+       "      <td>EUR</td>\n",
+       "      <td>2504580</td>\n",
+       "      <td>2022-12-24</td>\n",
+       "      <td>08:00</td>\n",
+       "      <td>61.980</td>\n",
+       "      <td>62.000</td>\n",
+       "      <td>61.980</td>\n",
+       "      <td>61.980</td>\n",
+       "      <td>4415</td>\n",
+       "      <td>7</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>2</th>\n",
+       "      <td>DE0005102008</td>\n",
+       "      <td>BSL</td>\n",
+       "      <td>BASLER AG O.N.</td>\n",
+       "      <td>Common stock</td>\n",
+       "      <td>EUR</td>\n",
+       "      <td>2504880</td>\n",
+       "      <td>2022-12-24</td>\n",
+       "      <td>08:00</td>\n",
+       "      <td>108.800</td>\n",
+       "      <td>108.800</td>\n",
+       "      <td>108.800</td>\n",
+       "      <td>108.800</td>\n",
+       "      <td>1</td>\n",
+       "      <td>1</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>3</th>\n",
+       "      <td>DE0005103006</td>\n",
+       "      <td>ADV</td>\n",
+       "      <td>ADVA OPT.NETW.SE  O.N.</td>\n",
+       "      <td>Common stock</td>\n",
+       "      <td>EUR</td>\n",
+       "      <td>2504881</td>\n",
+       "      <td>2022-12-24</td>\n",
+       "      <td>08:00</td>\n",
+       "      <td>14.500</td>\n",
+       "      <td>14.540</td>\n",
+       "      <td>14.500</td>\n",
+       "      <td>14.500</td>\n",
+       "      <td>5315</td>\n",
+       "      <td>6</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>4</th>\n",
+       "      <td>DE0005194005</td>\n",
+       "      <td>BYW</td>\n",
+       "      <td>BAYWA AG   NA O.N.</td>\n",
+       "      <td>Common stock</td>\n",
+       "      <td>EUR</td>\n",
+       "      <td>2504902</td>\n",
+       "      <td>2022-12-24</td>\n",
+       "      <td>08:00</td>\n",
+       "      <td>49.200</td>\n",
+       "      <td>49.200</td>\n",
+       "      <td>49.200</td>\n",
+       "      <td>49.200</td>\n",
+       "      <td>10</td>\n",
+       "      <td>1</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>...</th>\n",
+       "      <td>...</td>\n",
+       "      <td>...</td>\n",
+       "      <td>...</td>\n",
+       "      <td>...</td>\n",
+       "      <td>...</td>\n",
+       "      <td>...</td>\n",
+       "      <td>...</td>\n",
+       "      <td>...</td>\n",
+       "      <td>...</td>\n",
+       "      <td>...</td>\n",
+       "      <td>...</td>\n",
+       "      <td>...</td>\n",
+       "      <td>...</td>\n",
+       "      <td>...</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>1111171</th>\n",
+       "      <td>GB00BLD4ZP54</td>\n",
+       "      <td>CLTC</td>\n",
+       "      <td>COINSHARES DIG.SEC.OEND</td>\n",
+       "      <td>ETN</td>\n",
+       "      <td>EUR</td>\n",
+       "      <td>6479084</td>\n",
+       "      <td>2022-12-31</td>\n",
+       "      <td>16:46</td>\n",
+       "      <td>19.324</td>\n",
+       "      <td>19.324</td>\n",
+       "      <td>19.324</td>\n",
+       "      <td>19.324</td>\n",
+       "      <td>0</td>\n",
+       "      <td>2</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>1111172</th>\n",
+       "      <td>LU1923627332</td>\n",
+       "      <td>RUSL</td>\n",
+       "      <td>MUL-LYX.MSCI RUSSI.DIS.LS</td>\n",
+       "      <td>ETF</td>\n",
+       "      <td>EUR</td>\n",
+       "      <td>5424594</td>\n",
+       "      <td>2022-12-31</td>\n",
+       "      <td>16:52</td>\n",
+       "      <td>12.400</td>\n",
+       "      <td>12.400</td>\n",
+       "      <td>12.400</td>\n",
+       "      <td>12.400</td>\n",
+       "      <td>2645</td>\n",
+       "      <td>2</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>1111173</th>\n",
+       "      <td>US98956P1021</td>\n",
+       "      <td>ZIM</td>\n",
+       "      <td>ZIMMER BIOMET HLDGS DL-01</td>\n",
+       "      <td>Common stock</td>\n",
+       "      <td>EUR</td>\n",
+       "      <td>4582018</td>\n",
+       "      <td>2022-12-31</td>\n",
+       "      <td>20:30</td>\n",
+       "      <td>113.100</td>\n",
+       "      <td>113.100</td>\n",
+       "      <td>113.100</td>\n",
+       "      <td>113.100</td>\n",
+       "      <td>0</td>\n",
+       "      <td>1</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>1111174</th>\n",
+       "      <td>US9224171002</td>\n",
+       "      <td>VEO</td>\n",
+       "      <td>VEECO INSTRUMENTS  DL-,01</td>\n",
+       "      <td>Common stock</td>\n",
+       "      <td>EUR</td>\n",
+       "      <td>6198311</td>\n",
+       "      <td>2022-12-31</td>\n",
+       "      <td>20:30</td>\n",
+       "      <td>24.600</td>\n",
+       "      <td>24.600</td>\n",
+       "      <td>24.600</td>\n",
+       "      <td>24.600</td>\n",
+       "      <td>0</td>\n",
+       "      <td>1</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>1111175</th>\n",
+       "      <td>IT0005143547</td>\n",
+       "      <td>EM8</td>\n",
+       "      <td>ENERGICA MOTOR CO.S.P.A.</td>\n",
+       "      <td>Common stock</td>\n",
+       "      <td>EUR</td>\n",
+       "      <td>7026075</td>\n",
+       "      <td>2022-12-31</td>\n",
+       "      <td>20:30</td>\n",
+       "      <td>3.100</td>\n",
+       "      <td>3.100</td>\n",
+       "      <td>3.100</td>\n",
+       "      <td>3.100</td>\n",
+       "      <td>0</td>\n",
+       "      <td>1</td>\n",
+       "    </tr>\n",
+       "  </tbody>\n",
+       "</table>\n",
+       "<p>1111176 rows × 14 columns</p>\n",
+       "</div>"
+      ],
+      "text/plain": [
+       "                 ISIN Mnemonic               SecurityDesc  SecurityType  \\\n",
+       "0        DE000A1J5RX9      O2D    TELEFONICA DTLD HLDG NA  Common stock   \n",
+       "1        DE000A13SX22      HLE   HELLA GMBH+CO. KGAA O.N.  Common stock   \n",
+       "2        DE0005102008      BSL             BASLER AG O.N.  Common stock   \n",
+       "3        DE0005103006      ADV     ADVA OPT.NETW.SE  O.N.  Common stock   \n",
+       "4        DE0005194005      BYW         BAYWA AG   NA O.N.  Common stock   \n",
+       "...               ...      ...                        ...           ...   \n",
+       "1111171  GB00BLD4ZP54     CLTC    COINSHARES DIG.SEC.OEND           ETN   \n",
+       "1111172  LU1923627332     RUSL  MUL-LYX.MSCI RUSSI.DIS.LS           ETF   \n",
+       "1111173  US98956P1021      ZIM  ZIMMER BIOMET HLDGS DL-01  Common stock   \n",
+       "1111174  US9224171002      VEO  VEECO INSTRUMENTS  DL-,01  Common stock   \n",
+       "1111175  IT0005143547      EM8   ENERGICA MOTOR CO.S.P.A.  Common stock   \n",
+       "\n",
+       "        Currency SecurityID        Date   Time  StartPrice  MaxPrice  \\\n",
+       "0            EUR    2504492  2022-12-24  08:00       2.433     2.444   \n",
+       "1            EUR    2504580  2022-12-24  08:00      61.980    62.000   \n",
+       "2            EUR    2504880  2022-12-24  08:00     108.800   108.800   \n",
+       "3            EUR    2504881  2022-12-24  08:00      14.500    14.540   \n",
+       "4            EUR    2504902  2022-12-24  08:00      49.200    49.200   \n",
+       "...          ...        ...         ...    ...         ...       ...   \n",
+       "1111171      EUR    6479084  2022-12-31  16:46      19.324    19.324   \n",
+       "1111172      EUR    5424594  2022-12-31  16:52      12.400    12.400   \n",
+       "1111173      EUR    4582018  2022-12-31  20:30     113.100   113.100   \n",
+       "1111174      EUR    6198311  2022-12-31  20:30      24.600    24.600   \n",
+       "1111175      EUR    7026075  2022-12-31  20:30       3.100     3.100   \n",
+       "\n",
+       "         MinPrice  EndPrice TradedVolume NumberOfTrades  \n",
+       "0           2.433     2.438       183342             14  \n",
+       "1          61.980    61.980         4415              7  \n",
+       "2         108.800   108.800            1              1  \n",
+       "3          14.500    14.500         5315              6  \n",
+       "4          49.200    49.200           10              1  \n",
+       "...           ...       ...          ...            ...  \n",
+       "1111171    19.324    19.324            0              2  \n",
+       "1111172    12.400    12.400         2645              2  \n",
+       "1111173   113.100   113.100            0              1  \n",
+       "1111174    24.600    24.600            0              1  \n",
+       "1111175     3.100     3.100            0              1  \n",
+       "\n",
+       "[1111176 rows x 14 columns]"
+      ]
+     },
+     "execution_count": 34,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "# df_merged now contains all the data combined in a single dataframe\n",
+    "df_merged"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 35,
+   "id": "716db664-929e-43aa-83d8-a74d794bc6d1",
+   "metadata": {},
+   "outputs": [
+    {
+     "data": {
+      "text/html": [
+       "<div>\n",
+       "<style scoped>\n",
+       "    .dataframe tbody tr th:only-of-type {\n",
+       "        vertical-align: middle;\n",
+       "    }\n",
+       "\n",
+       "    .dataframe tbody tr th {\n",
+       "        vertical-align: top;\n",
+       "    }\n",
+       "\n",
+       "    .dataframe thead th {\n",
+       "        text-align: right;\n",
+       "    }\n",
+       "</style>\n",
+       "<table border=\"1\" class=\"dataframe\">\n",
+       "  <thead>\n",
+       "    <tr style=\"text-align: right;\">\n",
+       "      <th></th>\n",
+       "      <th>ISIN</th>\n",
+       "      <th>Date</th>\n",
+       "      <th>Time</th>\n",
+       "      <th>StartPrice</th>\n",
+       "      <th>MaxPrice</th>\n",
+       "      <th>MinPrice</th>\n",
+       "      <th>EndPrice</th>\n",
+       "      <th>TradedVolume</th>\n",
+       "    </tr>\n",
+       "  </thead>\n",
+       "  <tbody>\n",
+       "    <tr>\n",
+       "      <th>0</th>\n",
+       "      <td>DE000A1J5RX9</td>\n",
+       "      <td>2022-12-24</td>\n",
+       "      <td>08:00</td>\n",
+       "      <td>2.433</td>\n",
+       "      <td>2.444</td>\n",
+       "      <td>2.433</td>\n",
+       "      <td>2.438</td>\n",
+       "      <td>183342</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>1</th>\n",
+       "      <td>DE000A13SX22</td>\n",
+       "      <td>2022-12-24</td>\n",
+       "      <td>08:00</td>\n",
+       "      <td>61.980</td>\n",
+       "      <td>62.000</td>\n",
+       "      <td>61.980</td>\n",
+       "      <td>61.980</td>\n",
+       "      <td>4415</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>2</th>\n",
+       "      <td>DE0005102008</td>\n",
+       "      <td>2022-12-24</td>\n",
+       "      <td>08:00</td>\n",
+       "      <td>108.800</td>\n",
+       "      <td>108.800</td>\n",
+       "      <td>108.800</td>\n",
+       "      <td>108.800</td>\n",
+       "      <td>1</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>3</th>\n",
+       "      <td>DE0005103006</td>\n",
+       "      <td>2022-12-24</td>\n",
+       "      <td>08:00</td>\n",
+       "      <td>14.500</td>\n",
+       "      <td>14.540</td>\n",
+       "      <td>14.500</td>\n",
+       "      <td>14.500</td>\n",
+       "      <td>5315</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>4</th>\n",
+       "      <td>DE0005194005</td>\n",
+       "      <td>2022-12-24</td>\n",
+       "      <td>08:00</td>\n",
+       "      <td>49.200</td>\n",
+       "      <td>49.200</td>\n",
+       "      <td>49.200</td>\n",
+       "      <td>49.200</td>\n",
+       "      <td>10</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>...</th>\n",
+       "      <td>...</td>\n",
+       "      <td>...</td>\n",
+       "      <td>...</td>\n",
+       "      <td>...</td>\n",
+       "      <td>...</td>\n",
+       "      <td>...</td>\n",
+       "      <td>...</td>\n",
+       "      <td>...</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>1111171</th>\n",
+       "      <td>GB00BLD4ZP54</td>\n",
+       "      <td>2022-12-31</td>\n",
+       "      <td>16:46</td>\n",
+       "      <td>19.324</td>\n",
+       "      <td>19.324</td>\n",
+       "      <td>19.324</td>\n",
+       "      <td>19.324</td>\n",
+       "      <td>0</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>1111172</th>\n",
+       "      <td>LU1923627332</td>\n",
+       "      <td>2022-12-31</td>\n",
+       "      <td>16:52</td>\n",
+       "      <td>12.400</td>\n",
+       "      <td>12.400</td>\n",
+       "      <td>12.400</td>\n",
+       "      <td>12.400</td>\n",
+       "      <td>2645</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>1111173</th>\n",
+       "      <td>US98956P1021</td>\n",
+       "      <td>2022-12-31</td>\n",
+       "      <td>20:30</td>\n",
+       "      <td>113.100</td>\n",
+       "      <td>113.100</td>\n",
+       "      <td>113.100</td>\n",
+       "      <td>113.100</td>\n",
+       "      <td>0</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>1111174</th>\n",
+       "      <td>US9224171002</td>\n",
+       "      <td>2022-12-31</td>\n",
+       "      <td>20:30</td>\n",
+       "      <td>24.600</td>\n",
+       "      <td>24.600</td>\n",
+       "      <td>24.600</td>\n",
+       "      <td>24.600</td>\n",
+       "      <td>0</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>1111175</th>\n",
+       "      <td>IT0005143547</td>\n",
+       "      <td>2022-12-31</td>\n",
+       "      <td>20:30</td>\n",
+       "      <td>3.100</td>\n",
+       "      <td>3.100</td>\n",
+       "      <td>3.100</td>\n",
+       "      <td>3.100</td>\n",
+       "      <td>0</td>\n",
+       "    </tr>\n",
+       "  </tbody>\n",
+       "</table>\n",
+       "<p>1111176 rows × 8 columns</p>\n",
+       "</div>"
+      ],
+      "text/plain": [
+       "                 ISIN        Date   Time  StartPrice  MaxPrice  MinPrice  \\\n",
+       "0        DE000A1J5RX9  2022-12-24  08:00       2.433     2.444     2.433   \n",
+       "1        DE000A13SX22  2022-12-24  08:00      61.980    62.000    61.980   \n",
+       "2        DE0005102008  2022-12-24  08:00     108.800   108.800   108.800   \n",
+       "3        DE0005103006  2022-12-24  08:00      14.500    14.540    14.500   \n",
+       "4        DE0005194005  2022-12-24  08:00      49.200    49.200    49.200   \n",
+       "...               ...         ...    ...         ...       ...       ...   \n",
+       "1111171  GB00BLD4ZP54  2022-12-31  16:46      19.324    19.324    19.324   \n",
+       "1111172  LU1923627332  2022-12-31  16:52      12.400    12.400    12.400   \n",
+       "1111173  US98956P1021  2022-12-31  20:30     113.100   113.100   113.100   \n",
+       "1111174  US9224171002  2022-12-31  20:30      24.600    24.600    24.600   \n",
+       "1111175  IT0005143547  2022-12-31  20:30       3.100     3.100     3.100   \n",
+       "\n",
+       "         EndPrice TradedVolume  \n",
+       "0           2.438       183342  \n",
+       "1          61.980         4415  \n",
+       "2         108.800            1  \n",
+       "3          14.500         5315  \n",
+       "4          49.200           10  \n",
+       "...           ...          ...  \n",
+       "1111171    19.324            0  \n",
+       "1111172    12.400         2645  \n",
+       "1111173   113.100            0  \n",
+       "1111174    24.600            0  \n",
+       "1111175     3.100            0  \n",
+       "\n",
+       "[1111176 rows x 8 columns]"
+      ]
+     },
+     "execution_count": 35,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "# Filtering our merged dataframe to only those columns which we need for further process\n",
+    "df_merged = df_merged.loc[:,columns_to_included]\n",
+    "df_merged"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "2093bf04-2f6b-483d-b521-809a6457c9ec",
+   "metadata": {},
+   "source": [
+    "* df_merged now containes only those columns which we need for further analysis"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 36,
+   "id": "8199b90f-1275-478c-af59-e525fe83ab44",
+   "metadata": {},
+   "outputs": [
+    {
+     "data": {
+      "text/plain": [
+       "ISIN            0\n",
+       "Date            0\n",
+       "Time            0\n",
+       "StartPrice      0\n",
+       "MaxPrice        0\n",
+       "MinPrice        0\n",
+       "EndPrice        0\n",
+       "TradedVolume    0\n",
+       "dtype: int64"
+      ]
+     },
+     "execution_count": 36,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "# Lets check our dataset for any Null Values\n",
+    "df_merged.isna().sum()"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "28dbdd54-b586-440b-a6df-7056cc65ffe0",
+   "metadata": {},
+   "source": [
+    "## Data Transformation"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 37,
+   "id": "4bf6f1df-0c23-4e49-add6-cb9bbbd0c47b",
+   "metadata": {},
+   "outputs": [
+    {
+     "data": {
+      "text/html": [
+       "<div>\n",
+       "<style scoped>\n",
+       "    .dataframe tbody tr th:only-of-type {\n",
+       "        vertical-align: middle;\n",
+       "    }\n",
+       "\n",
+       "    .dataframe tbody tr th {\n",
+       "        vertical-align: top;\n",
+       "    }\n",
+       "\n",
+       "    .dataframe thead th {\n",
+       "        text-align: right;\n",
+       "    }\n",
+       "</style>\n",
+       "<table border=\"1\" class=\"dataframe\">\n",
+       "  <thead>\n",
+       "    <tr style=\"text-align: right;\">\n",
+       "      <th></th>\n",
+       "      <th>ISIN</th>\n",
+       "      <th>Date</th>\n",
+       "      <th>Time</th>\n",
+       "      <th>StartPrice</th>\n",
+       "      <th>MaxPrice</th>\n",
+       "      <th>MinPrice</th>\n",
+       "      <th>EndPrice</th>\n",
+       "      <th>TradedVolume</th>\n",
+       "    </tr>\n",
+       "  </thead>\n",
+       "  <tbody>\n",
+       "    <tr>\n",
+       "      <th>174258</th>\n",
+       "      <td>AT0000A0E9W5</td>\n",
+       "      <td>2022-12-25</td>\n",
+       "      <td>08:00</td>\n",
+       "      <td>14.02</td>\n",
+       "      <td>14.27</td>\n",
+       "      <td>14.02</td>\n",
+       "      <td>14.27</td>\n",
+       "      <td>1466</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>174435</th>\n",
+       "      <td>AT0000A0E9W5</td>\n",
+       "      <td>2022-12-25</td>\n",
+       "      <td>08:02</td>\n",
+       "      <td>14.27</td>\n",
+       "      <td>14.29</td>\n",
+       "      <td>14.27</td>\n",
+       "      <td>14.29</td>\n",
+       "      <td>351</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>174633</th>\n",
+       "      <td>AT0000A0E9W5</td>\n",
+       "      <td>2022-12-25</td>\n",
+       "      <td>08:03</td>\n",
+       "      <td>14.27</td>\n",
+       "      <td>14.29</td>\n",
+       "      <td>14.27</td>\n",
+       "      <td>14.29</td>\n",
+       "      <td>105</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>174784</th>\n",
+       "      <td>AT0000A0E9W5</td>\n",
+       "      <td>2022-12-25</td>\n",
+       "      <td>08:04</td>\n",
+       "      <td>14.29</td>\n",
+       "      <td>14.29</td>\n",
+       "      <td>14.29</td>\n",
+       "      <td>14.29</td>\n",
+       "      <td>40</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>176890</th>\n",
+       "      <td>AT0000A0E9W5</td>\n",
+       "      <td>2022-12-25</td>\n",
+       "      <td>08:05</td>\n",
+       "      <td>14.24</td>\n",
+       "      <td>14.24</td>\n",
+       "      <td>14.16</td>\n",
+       "      <td>14.16</td>\n",
+       "      <td>912</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>...</th>\n",
+       "      <td>...</td>\n",
+       "      <td>...</td>\n",
+       "      <td>...</td>\n",
+       "      <td>...</td>\n",
+       "      <td>...</td>\n",
+       "      <td>...</td>\n",
+       "      <td>...</td>\n",
+       "      <td>...</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>304253</th>\n",
+       "      <td>AT0000A0E9W5</td>\n",
+       "      <td>2022-12-25</td>\n",
+       "      <td>16:21</td>\n",
+       "      <td>13.91</td>\n",
+       "      <td>13.96</td>\n",
+       "      <td>13.90</td>\n",
+       "      <td>13.96</td>\n",
+       "      <td>4551</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>304807</th>\n",
+       "      <td>AT0000A0E9W5</td>\n",
+       "      <td>2022-12-25</td>\n",
+       "      <td>16:23</td>\n",
+       "      <td>13.98</td>\n",
+       "      <td>13.99</td>\n",
+       "      <td>13.98</td>\n",
+       "      <td>13.98</td>\n",
+       "      <td>709</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>306625</th>\n",
+       "      <td>AT0000A0E9W5</td>\n",
+       "      <td>2022-12-25</td>\n",
+       "      <td>16:28</td>\n",
+       "      <td>13.94</td>\n",
+       "      <td>13.94</td>\n",
+       "      <td>13.94</td>\n",
+       "      <td>13.94</td>\n",
+       "      <td>792</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>306951</th>\n",
+       "      <td>AT0000A0E9W5</td>\n",
+       "      <td>2022-12-25</td>\n",
+       "      <td>16:29</td>\n",
+       "      <td>13.93</td>\n",
+       "      <td>13.93</td>\n",
+       "      <td>13.92</td>\n",
+       "      <td>13.92</td>\n",
+       "      <td>975</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>307538</th>\n",
+       "      <td>AT0000A0E9W5</td>\n",
+       "      <td>2022-12-25</td>\n",
+       "      <td>16:35</td>\n",
+       "      <td>14.01</td>\n",
+       "      <td>14.01</td>\n",
+       "      <td>14.01</td>\n",
+       "      <td>14.01</td>\n",
+       "      <td>28064</td>\n",
+       "    </tr>\n",
+       "  </tbody>\n",
+       "</table>\n",
+       "<p>157 rows × 8 columns</p>\n",
+       "</div>"
+      ],
+      "text/plain": [
+       "                ISIN        Date   Time  StartPrice  MaxPrice  MinPrice  \\\n",
+       "174258  AT0000A0E9W5  2022-12-25  08:00       14.02     14.27     14.02   \n",
+       "174435  AT0000A0E9W5  2022-12-25  08:02       14.27     14.29     14.27   \n",
+       "174633  AT0000A0E9W5  2022-12-25  08:03       14.27     14.29     14.27   \n",
+       "174784  AT0000A0E9W5  2022-12-25  08:04       14.29     14.29     14.29   \n",
+       "176890  AT0000A0E9W5  2022-12-25  08:05       14.24     14.24     14.16   \n",
+       "...              ...         ...    ...         ...       ...       ...   \n",
+       "304253  AT0000A0E9W5  2022-12-25  16:21       13.91     13.96     13.90   \n",
+       "304807  AT0000A0E9W5  2022-12-25  16:23       13.98     13.99     13.98   \n",
+       "306625  AT0000A0E9W5  2022-12-25  16:28       13.94     13.94     13.94   \n",
+       "306951  AT0000A0E9W5  2022-12-25  16:29       13.93     13.93     13.92   \n",
+       "307538  AT0000A0E9W5  2022-12-25  16:35       14.01     14.01     14.01   \n",
+       "\n",
+       "        EndPrice TradedVolume  \n",
+       "174258     14.27         1466  \n",
+       "174435     14.29          351  \n",
+       "174633     14.29          105  \n",
+       "174784     14.29           40  \n",
+       "176890     14.16          912  \n",
+       "...          ...          ...  \n",
+       "304253     13.96         4551  \n",
+       "304807     13.98          709  \n",
+       "306625     13.94          792  \n",
+       "306951     13.92          975  \n",
+       "307538     14.01        28064  \n",
+       "\n",
+       "[157 rows x 8 columns]"
+      ]
+     },
+     "execution_count": 37,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "# Lets check the dataframe to see whether we have any opening_price for the day\n",
+    "df_merged[(df_merged['ISIN'] == 'AT0000A0E9W5') & (df_merged['Date']== '2022-12-25')].sort_values(['Time'])"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "8d08095a-83ac-4966-85f3-dc51c895139a",
+   "metadata": {},
+   "source": [
+    "* We can see that there is no column which provides us details about the opening price for a particular date\n",
+    "* Now in the next steps we will create a few columns like opening_price, closing_price etc, which will be a part of our data transformation process."
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "09e766cb-efc0-4d68-b492-9aec02788bb4",
+   "metadata": {},
+   "source": [
+    "### Get Opening price per ISIN per day"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 38,
+   "id": "7dc9f0eb-5a5f-4ccd-9750-342cd830dc1b",
+   "metadata": {},
+   "outputs": [
+    {
+     "data": {
+      "text/html": [
+       "<div>\n",
+       "<style scoped>\n",
+       "    .dataframe tbody tr th:only-of-type {\n",
+       "        vertical-align: middle;\n",
+       "    }\n",
+       "\n",
+       "    .dataframe tbody tr th {\n",
+       "        vertical-align: top;\n",
+       "    }\n",
+       "\n",
+       "    .dataframe thead th {\n",
+       "        text-align: right;\n",
+       "    }\n",
+       "</style>\n",
+       "<table border=\"1\" class=\"dataframe\">\n",
+       "  <thead>\n",
+       "    <tr style=\"text-align: right;\">\n",
+       "      <th></th>\n",
+       "      <th>ISIN</th>\n",
+       "      <th>Date</th>\n",
+       "      <th>Time</th>\n",
+       "      <th>StartPrice</th>\n",
+       "      <th>MaxPrice</th>\n",
+       "      <th>MinPrice</th>\n",
+       "      <th>EndPrice</th>\n",
+       "      <th>TradedVolume</th>\n",
+       "      <th>opening_price</th>\n",
+       "    </tr>\n",
+       "  </thead>\n",
+       "  <tbody>\n",
+       "    <tr>\n",
+       "      <th>2858</th>\n",
+       "      <td>AT0000A0E9W5</td>\n",
+       "      <td>2022-12-24</td>\n",
+       "      <td>08:09</td>\n",
+       "      <td>13.20</td>\n",
+       "      <td>13.50</td>\n",
+       "      <td>13.00</td>\n",
+       "      <td>13.50</td>\n",
+       "      <td>16763</td>\n",
+       "      <td>13.20</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>3421</th>\n",
+       "      <td>AT0000A0E9W5</td>\n",
+       "      <td>2022-12-24</td>\n",
+       "      <td>08:10</td>\n",
+       "      <td>13.67</td>\n",
+       "      <td>13.67</td>\n",
+       "      <td>13.67</td>\n",
+       "      <td>13.67</td>\n",
+       "      <td>400</td>\n",
+       "      <td>13.20</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>3789</th>\n",
+       "      <td>AT0000A0E9W5</td>\n",
+       "      <td>2022-12-24</td>\n",
+       "      <td>08:11</td>\n",
+       "      <td>13.71</td>\n",
+       "      <td>13.88</td>\n",
+       "      <td>13.71</td>\n",
+       "      <td>13.88</td>\n",
+       "      <td>1505</td>\n",
+       "      <td>13.20</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>4127</th>\n",
+       "      <td>AT0000A0E9W5</td>\n",
+       "      <td>2022-12-24</td>\n",
+       "      <td>08:12</td>\n",
+       "      <td>13.90</td>\n",
+       "      <td>13.92</td>\n",
+       "      <td>13.90</td>\n",
+       "      <td>13.92</td>\n",
+       "      <td>500</td>\n",
+       "      <td>13.20</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>4453</th>\n",
+       "      <td>AT0000A0E9W5</td>\n",
+       "      <td>2022-12-24</td>\n",
+       "      <td>08:13</td>\n",
+       "      <td>13.93</td>\n",
+       "      <td>13.93</td>\n",
+       "      <td>13.93</td>\n",
+       "      <td>13.93</td>\n",
+       "      <td>324</td>\n",
+       "      <td>13.20</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>...</th>\n",
+       "      <td>...</td>\n",
+       "      <td>...</td>\n",
+       "      <td>...</td>\n",
+       "      <td>...</td>\n",
+       "      <td>...</td>\n",
+       "      <td>...</td>\n",
+       "      <td>...</td>\n",
+       "      <td>...</td>\n",
+       "      <td>...</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>1106344</th>\n",
+       "      <td>AT0000A0E9W5</td>\n",
+       "      <td>2022-12-31</td>\n",
+       "      <td>16:26</td>\n",
+       "      <td>14.04</td>\n",
+       "      <td>14.04</td>\n",
+       "      <td>14.04</td>\n",
+       "      <td>14.04</td>\n",
+       "      <td>1129</td>\n",
+       "      <td>13.88</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>1106720</th>\n",
+       "      <td>AT0000A0E9W5</td>\n",
+       "      <td>2022-12-31</td>\n",
+       "      <td>16:27</td>\n",
+       "      <td>14.03</td>\n",
+       "      <td>14.14</td>\n",
+       "      <td>14.02</td>\n",
+       "      <td>14.04</td>\n",
+       "      <td>6627</td>\n",
+       "      <td>13.88</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>1107014</th>\n",
+       "      <td>AT0000A0E9W5</td>\n",
+       "      <td>2022-12-31</td>\n",
+       "      <td>16:28</td>\n",
+       "      <td>14.04</td>\n",
+       "      <td>14.04</td>\n",
+       "      <td>14.03</td>\n",
+       "      <td>14.03</td>\n",
+       "      <td>2003</td>\n",
+       "      <td>13.88</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>1107365</th>\n",
+       "      <td>AT0000A0E9W5</td>\n",
+       "      <td>2022-12-31</td>\n",
+       "      <td>16:29</td>\n",
+       "      <td>14.08</td>\n",
+       "      <td>14.08</td>\n",
+       "      <td>14.00</td>\n",
+       "      <td>14.00</td>\n",
+       "      <td>354</td>\n",
+       "      <td>13.88</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>1107941</th>\n",
+       "      <td>AT0000A0E9W5</td>\n",
+       "      <td>2022-12-31</td>\n",
+       "      <td>16:35</td>\n",
+       "      <td>14.08</td>\n",
+       "      <td>14.08</td>\n",
+       "      <td>14.08</td>\n",
+       "      <td>14.08</td>\n",
+       "      <td>35170</td>\n",
+       "      <td>13.88</td>\n",
+       "    </tr>\n",
+       "  </tbody>\n",
+       "</table>\n",
+       "<p>1142 rows × 9 columns</p>\n",
+       "</div>"
+      ],
+      "text/plain": [
+       "                 ISIN        Date   Time  StartPrice  MaxPrice  MinPrice  \\\n",
+       "2858     AT0000A0E9W5  2022-12-24  08:09       13.20     13.50     13.00   \n",
+       "3421     AT0000A0E9W5  2022-12-24  08:10       13.67     13.67     13.67   \n",
+       "3789     AT0000A0E9W5  2022-12-24  08:11       13.71     13.88     13.71   \n",
+       "4127     AT0000A0E9W5  2022-12-24  08:12       13.90     13.92     13.90   \n",
+       "4453     AT0000A0E9W5  2022-12-24  08:13       13.93     13.93     13.93   \n",
+       "...               ...         ...    ...         ...       ...       ...   \n",
+       "1106344  AT0000A0E9W5  2022-12-31  16:26       14.04     14.04     14.04   \n",
+       "1106720  AT0000A0E9W5  2022-12-31  16:27       14.03     14.14     14.02   \n",
+       "1107014  AT0000A0E9W5  2022-12-31  16:28       14.04     14.04     14.03   \n",
+       "1107365  AT0000A0E9W5  2022-12-31  16:29       14.08     14.08     14.00   \n",
+       "1107941  AT0000A0E9W5  2022-12-31  16:35       14.08     14.08     14.08   \n",
+       "\n",
+       "         EndPrice TradedVolume  opening_price  \n",
+       "2858        13.50        16763          13.20  \n",
+       "3421        13.67          400          13.20  \n",
+       "3789        13.88         1505          13.20  \n",
+       "4127        13.92          500          13.20  \n",
+       "4453        13.93          324          13.20  \n",
+       "...           ...          ...            ...  \n",
+       "1106344     14.04         1129          13.88  \n",
+       "1106720     14.04         6627          13.88  \n",
+       "1107014     14.03         2003          13.88  \n",
+       "1107365     14.00          354          13.88  \n",
+       "1107941     14.08        35170          13.88  \n",
+       "\n",
+       "[1142 rows x 9 columns]"
+      ]
+     },
+     "execution_count": 38,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "# Creating a new column opening_price, which will be equal to the first reported StartPrice per ISIN per Day\n",
+    "df_merged['opening_price'] = df_merged.sort_values(['Time']).groupby(['ISIN', 'Date'])['StartPrice'].transform('first')\n",
+    "df_merged[(df_merged['ISIN'] == 'AT0000A0E9W5')]"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "5b90401f-9841-4dba-a147-9580c9e4dcb5",
+   "metadata": {},
+   "source": [
+    "* Now we have a column which shows the opening price per ISIN per day.\n",
+    "* We will now create some more columns in the same fashion which are needed for further analysis"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "e1ff75e3-0319-494f-a3a8-f40070a8f530",
+   "metadata": {},
+   "source": [
+    "### Get Closing price per ISIN per day"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 39,
+   "id": "8c6ada88-8c45-412e-aca4-f2f2e011afd9",
+   "metadata": {},
+   "outputs": [
+    {
+     "data": {
+      "text/html": [
+       "<div>\n",
+       "<style scoped>\n",
+       "    .dataframe tbody tr th:only-of-type {\n",
+       "        vertical-align: middle;\n",
+       "    }\n",
+       "\n",
+       "    .dataframe tbody tr th {\n",
+       "        vertical-align: top;\n",
+       "    }\n",
+       "\n",
+       "    .dataframe thead th {\n",
+       "        text-align: right;\n",
+       "    }\n",
+       "</style>\n",
+       "<table border=\"1\" class=\"dataframe\">\n",
+       "  <thead>\n",
+       "    <tr style=\"text-align: right;\">\n",
+       "      <th></th>\n",
+       "      <th>ISIN</th>\n",
+       "      <th>Date</th>\n",
+       "      <th>Time</th>\n",
+       "      <th>StartPrice</th>\n",
+       "      <th>MaxPrice</th>\n",
+       "      <th>MinPrice</th>\n",
+       "      <th>EndPrice</th>\n",
+       "      <th>TradedVolume</th>\n",
+       "      <th>opening_price</th>\n",
+       "      <th>closing_price</th>\n",
+       "    </tr>\n",
+       "  </thead>\n",
+       "  <tbody>\n",
+       "    <tr>\n",
+       "      <th>2858</th>\n",
+       "      <td>AT0000A0E9W5</td>\n",
+       "      <td>2022-12-24</td>\n",
+       "      <td>08:09</td>\n",
+       "      <td>13.20</td>\n",
+       "      <td>13.50</td>\n",
+       "      <td>13.00</td>\n",
+       "      <td>13.50</td>\n",
+       "      <td>16763</td>\n",
+       "      <td>13.20</td>\n",
+       "      <td>14.01</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>3421</th>\n",
+       "      <td>AT0000A0E9W5</td>\n",
+       "      <td>2022-12-24</td>\n",
+       "      <td>08:10</td>\n",
+       "      <td>13.67</td>\n",
+       "      <td>13.67</td>\n",
+       "      <td>13.67</td>\n",
+       "      <td>13.67</td>\n",
+       "      <td>400</td>\n",
+       "      <td>13.20</td>\n",
+       "      <td>14.01</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>3789</th>\n",
+       "      <td>AT0000A0E9W5</td>\n",
+       "      <td>2022-12-24</td>\n",
+       "      <td>08:11</td>\n",
+       "      <td>13.71</td>\n",
+       "      <td>13.88</td>\n",
+       "      <td>13.71</td>\n",
+       "      <td>13.88</td>\n",
+       "      <td>1505</td>\n",
+       "      <td>13.20</td>\n",
+       "      <td>14.01</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>4127</th>\n",
+       "      <td>AT0000A0E9W5</td>\n",
+       "      <td>2022-12-24</td>\n",
+       "      <td>08:12</td>\n",
+       "      <td>13.90</td>\n",
+       "      <td>13.92</td>\n",
+       "      <td>13.90</td>\n",
+       "      <td>13.92</td>\n",
+       "      <td>500</td>\n",
+       "      <td>13.20</td>\n",
+       "      <td>14.01</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>4453</th>\n",
+       "      <td>AT0000A0E9W5</td>\n",
+       "      <td>2022-12-24</td>\n",
+       "      <td>08:13</td>\n",
+       "      <td>13.93</td>\n",
+       "      <td>13.93</td>\n",
+       "      <td>13.93</td>\n",
+       "      <td>13.93</td>\n",
+       "      <td>324</td>\n",
+       "      <td>13.20</td>\n",
+       "      <td>14.01</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>...</th>\n",
+       "      <td>...</td>\n",
+       "      <td>...</td>\n",
+       "      <td>...</td>\n",
+       "      <td>...</td>\n",
+       "      <td>...</td>\n",
+       "      <td>...</td>\n",
+       "      <td>...</td>\n",
+       "      <td>...</td>\n",
+       "      <td>...</td>\n",
+       "      <td>...</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>1106344</th>\n",
+       "      <td>AT0000A0E9W5</td>\n",
+       "      <td>2022-12-31</td>\n",
+       "      <td>16:26</td>\n",
+       "      <td>14.04</td>\n",
+       "      <td>14.04</td>\n",
+       "      <td>14.04</td>\n",
+       "      <td>14.04</td>\n",
+       "      <td>1129</td>\n",
+       "      <td>13.88</td>\n",
+       "      <td>14.08</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>1106720</th>\n",
+       "      <td>AT0000A0E9W5</td>\n",
+       "      <td>2022-12-31</td>\n",
+       "      <td>16:27</td>\n",
+       "      <td>14.03</td>\n",
+       "      <td>14.14</td>\n",
+       "      <td>14.02</td>\n",
+       "      <td>14.04</td>\n",
+       "      <td>6627</td>\n",
+       "      <td>13.88</td>\n",
+       "      <td>14.08</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>1107014</th>\n",
+       "      <td>AT0000A0E9W5</td>\n",
+       "      <td>2022-12-31</td>\n",
+       "      <td>16:28</td>\n",
+       "      <td>14.04</td>\n",
+       "      <td>14.04</td>\n",
+       "      <td>14.03</td>\n",
+       "      <td>14.03</td>\n",
+       "      <td>2003</td>\n",
+       "      <td>13.88</td>\n",
+       "      <td>14.08</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>1107365</th>\n",
+       "      <td>AT0000A0E9W5</td>\n",
+       "      <td>2022-12-31</td>\n",
+       "      <td>16:29</td>\n",
+       "      <td>14.08</td>\n",
+       "      <td>14.08</td>\n",
+       "      <td>14.00</td>\n",
+       "      <td>14.00</td>\n",
+       "      <td>354</td>\n",
+       "      <td>13.88</td>\n",
+       "      <td>14.08</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>1107941</th>\n",
+       "      <td>AT0000A0E9W5</td>\n",
+       "      <td>2022-12-31</td>\n",
+       "      <td>16:35</td>\n",
+       "      <td>14.08</td>\n",
+       "      <td>14.08</td>\n",
+       "      <td>14.08</td>\n",
+       "      <td>14.08</td>\n",
+       "      <td>35170</td>\n",
+       "      <td>13.88</td>\n",
+       "      <td>14.08</td>\n",
+       "    </tr>\n",
+       "  </tbody>\n",
+       "</table>\n",
+       "<p>1142 rows × 10 columns</p>\n",
+       "</div>"
+      ],
+      "text/plain": [
+       "                 ISIN        Date   Time  StartPrice  MaxPrice  MinPrice  \\\n",
+       "2858     AT0000A0E9W5  2022-12-24  08:09       13.20     13.50     13.00   \n",
+       "3421     AT0000A0E9W5  2022-12-24  08:10       13.67     13.67     13.67   \n",
+       "3789     AT0000A0E9W5  2022-12-24  08:11       13.71     13.88     13.71   \n",
+       "4127     AT0000A0E9W5  2022-12-24  08:12       13.90     13.92     13.90   \n",
+       "4453     AT0000A0E9W5  2022-12-24  08:13       13.93     13.93     13.93   \n",
+       "...               ...         ...    ...         ...       ...       ...   \n",
+       "1106344  AT0000A0E9W5  2022-12-31  16:26       14.04     14.04     14.04   \n",
+       "1106720  AT0000A0E9W5  2022-12-31  16:27       14.03     14.14     14.02   \n",
+       "1107014  AT0000A0E9W5  2022-12-31  16:28       14.04     14.04     14.03   \n",
+       "1107365  AT0000A0E9W5  2022-12-31  16:29       14.08     14.08     14.00   \n",
+       "1107941  AT0000A0E9W5  2022-12-31  16:35       14.08     14.08     14.08   \n",
+       "\n",
+       "         EndPrice TradedVolume  opening_price  closing_price  \n",
+       "2858        13.50        16763          13.20          14.01  \n",
+       "3421        13.67          400          13.20          14.01  \n",
+       "3789        13.88         1505          13.20          14.01  \n",
+       "4127        13.92          500          13.20          14.01  \n",
+       "4453        13.93          324          13.20          14.01  \n",
+       "...           ...          ...            ...            ...  \n",
+       "1106344     14.04         1129          13.88          14.08  \n",
+       "1106720     14.04         6627          13.88          14.08  \n",
+       "1107014     14.03         2003          13.88          14.08  \n",
+       "1107365     14.00          354          13.88          14.08  \n",
+       "1107941     14.08        35170          13.88          14.08  \n",
+       "\n",
+       "[1142 rows x 10 columns]"
+      ]
+     },
+     "execution_count": 39,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "# Creating a new column named closing_price\n",
+    "df_merged['closing_price'] = df_merged.sort_values(['Time']).groupby(['ISIN', 'Date'])['EndPrice'].transform('last')\n",
+    "df_merged[(df_merged['ISIN'] == 'AT0000A0E9W5')]"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "11b391c6-a47e-43d7-b756-0933ba5e3b5b",
+   "metadata": {},
+   "source": [
+    "### Aggregations"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 40,
+   "id": "43d7c99c-f686-4aa9-987a-987e23cd800d",
+   "metadata": {},
+   "outputs": [
+    {
+     "data": {
+      "text/plain": [
+       "Index(['ISIN', 'Date', 'Time', 'StartPrice', 'MaxPrice', 'MinPrice',\n",
+       "       'EndPrice', 'TradedVolume', 'opening_price', 'closing_price'],\n",
+       "      dtype='object')"
+      ]
+     },
+     "execution_count": 40,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "df_merged.columns"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 41,
+   "id": "51c1c5d1-90e8-4d7e-8712-7dde9d123118",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "df_merged = df_merged.groupby(['ISIN', 'Date'], as_index=False).agg(opening_price_eur=('opening_price', 'min'), closing_price_eur = ('closing_price', 'min'), mimimum_price_eur = ('MinPrice','min'), maximum_price_eur = ('MaxPrice','max'), daily_traded_volume =('TradedVolume','sum'))"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 42,
+   "id": "5348a7f9-2fb2-4bc0-9d2c-a7237a56dd7a",
+   "metadata": {},
+   "outputs": [
+    {
+     "data": {
+      "text/html": [
+       "<div>\n",
+       "<style scoped>\n",
+       "    .dataframe tbody tr th:only-of-type {\n",
+       "        vertical-align: middle;\n",
+       "    }\n",
+       "\n",
+       "    .dataframe tbody tr th {\n",
+       "        vertical-align: top;\n",
+       "    }\n",
+       "\n",
+       "    .dataframe thead th {\n",
+       "        text-align: right;\n",
+       "    }\n",
+       "</style>\n",
+       "<table border=\"1\" class=\"dataframe\">\n",
+       "  <thead>\n",
+       "    <tr style=\"text-align: right;\">\n",
+       "      <th></th>\n",
+       "      <th>ISIN</th>\n",
+       "      <th>Date</th>\n",
+       "      <th>opening_price_eur</th>\n",
+       "      <th>closing_price_eur</th>\n",
+       "      <th>mimimum_price_eur</th>\n",
+       "      <th>maximum_price_eur</th>\n",
+       "      <th>daily_traded_volume</th>\n",
+       "    </tr>\n",
+       "  </thead>\n",
+       "  <tbody>\n",
+       "    <tr>\n",
+       "      <th>0</th>\n",
+       "      <td>AT000000STR1</td>\n",
+       "      <td>2022-12-24</td>\n",
+       "      <td>36.05</td>\n",
+       "      <td>36.10</td>\n",
+       "      <td>35.65</td>\n",
+       "      <td>37.05</td>\n",
+       "      <td>1838</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>1</th>\n",
+       "      <td>AT000000STR1</td>\n",
+       "      <td>2022-12-25</td>\n",
+       "      <td>36.10</td>\n",
+       "      <td>37.70</td>\n",
+       "      <td>36.10</td>\n",
+       "      <td>37.70</td>\n",
+       "      <td>2864</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>2</th>\n",
+       "      <td>AT000000STR1</td>\n",
+       "      <td>2022-12-26</td>\n",
+       "      <td>36.10</td>\n",
+       "      <td>37.70</td>\n",
+       "      <td>36.10</td>\n",
+       "      <td>37.70</td>\n",
+       "      <td>2864</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>3</th>\n",
+       "      <td>AT000000STR1</td>\n",
+       "      <td>2022-12-27</td>\n",
+       "      <td>36.10</td>\n",
+       "      <td>37.70</td>\n",
+       "      <td>36.10</td>\n",
+       "      <td>37.70</td>\n",
+       "      <td>2864</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>4</th>\n",
+       "      <td>AT000000STR1</td>\n",
+       "      <td>2022-12-28</td>\n",
+       "      <td>36.60</td>\n",
+       "      <td>36.70</td>\n",
+       "      <td>35.75</td>\n",
+       "      <td>36.70</td>\n",
+       "      <td>1773</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>5</th>\n",
+       "      <td>AT000000STR1</td>\n",
+       "      <td>2022-12-29</td>\n",
+       "      <td>36.60</td>\n",
+       "      <td>36.70</td>\n",
+       "      <td>35.75</td>\n",
+       "      <td>36.70</td>\n",
+       "      <td>1773</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>6</th>\n",
+       "      <td>AT000000STR1</td>\n",
+       "      <td>2022-12-30</td>\n",
+       "      <td>36.60</td>\n",
+       "      <td>36.70</td>\n",
+       "      <td>35.75</td>\n",
+       "      <td>36.70</td>\n",
+       "      <td>1773</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>7</th>\n",
+       "      <td>AT000000STR1</td>\n",
+       "      <td>2022-12-31</td>\n",
+       "      <td>36.60</td>\n",
+       "      <td>36.70</td>\n",
+       "      <td>35.75</td>\n",
+       "      <td>36.70</td>\n",
+       "      <td>1773</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>8</th>\n",
+       "      <td>AT00000FACC2</td>\n",
+       "      <td>2022-12-24</td>\n",
+       "      <td>7.94</td>\n",
+       "      <td>7.96</td>\n",
+       "      <td>7.73</td>\n",
+       "      <td>7.96</td>\n",
+       "      <td>2785</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>9</th>\n",
+       "      <td>AT00000FACC2</td>\n",
+       "      <td>2022-12-25</td>\n",
+       "      <td>7.90</td>\n",
+       "      <td>8.36</td>\n",
+       "      <td>7.86</td>\n",
+       "      <td>8.36</td>\n",
+       "      <td>2490</td>\n",
+       "    </tr>\n",
+       "  </tbody>\n",
+       "</table>\n",
+       "</div>"
+      ],
+      "text/plain": [
+       "           ISIN        Date  opening_price_eur  closing_price_eur  \\\n",
+       "0  AT000000STR1  2022-12-24              36.05              36.10   \n",
+       "1  AT000000STR1  2022-12-25              36.10              37.70   \n",
+       "2  AT000000STR1  2022-12-26              36.10              37.70   \n",
+       "3  AT000000STR1  2022-12-27              36.10              37.70   \n",
+       "4  AT000000STR1  2022-12-28              36.60              36.70   \n",
+       "5  AT000000STR1  2022-12-29              36.60              36.70   \n",
+       "6  AT000000STR1  2022-12-30              36.60              36.70   \n",
+       "7  AT000000STR1  2022-12-31              36.60              36.70   \n",
+       "8  AT00000FACC2  2022-12-24               7.94               7.96   \n",
+       "9  AT00000FACC2  2022-12-25               7.90               8.36   \n",
+       "\n",
+       "   mimimum_price_eur  maximum_price_eur daily_traded_volume  \n",
+       "0              35.65              37.05                1838  \n",
+       "1              36.10              37.70                2864  \n",
+       "2              36.10              37.70                2864  \n",
+       "3              36.10              37.70                2864  \n",
+       "4              35.75              36.70                1773  \n",
+       "5              35.75              36.70                1773  \n",
+       "6              35.75              36.70                1773  \n",
+       "7              35.75              36.70                1773  \n",
+       "8               7.73               7.96                2785  \n",
+       "9               7.86               8.36                2490  "
+      ]
+     },
+     "execution_count": 42,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "df_merged.head(10)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "75d2fa99-49ed-488c-ad49-e152ef243927",
+   "metadata": {},
+   "source": [
+    "* After the above transformations we have:\n",
+    "    1. Opening Price Column for the day\n",
+    "    2. Closing price column for the day\n",
+    "    3. maximum price column for the day\n",
+    "    4. minimum price column for the day\n",
+    "    5. all the above columns show amount in Euros\n",
+    "    6. Daily traded volumn for a particular stock for a particular day "
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "5082d573-3ddc-4f23-8860-ab409f97d13e",
+   "metadata": {},
+   "source": [
+    "### Percent change previous closing"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 43,
+   "id": "be95d88b-3445-42f0-8143-629854cfe599",
+   "metadata": {
+    "scrolled": true
+   },
+   "outputs": [
+    {
+     "data": {
+      "text/html": [
+       "<div>\n",
+       "<style scoped>\n",
+       "    .dataframe tbody tr th:only-of-type {\n",
+       "        vertical-align: middle;\n",
+       "    }\n",
+       "\n",
+       "    .dataframe tbody tr th {\n",
+       "        vertical-align: top;\n",
+       "    }\n",
+       "\n",
+       "    .dataframe thead th {\n",
+       "        text-align: right;\n",
+       "    }\n",
+       "</style>\n",
+       "<table border=\"1\" class=\"dataframe\">\n",
+       "  <thead>\n",
+       "    <tr style=\"text-align: right;\">\n",
+       "      <th></th>\n",
+       "      <th>ISIN</th>\n",
+       "      <th>Date</th>\n",
+       "      <th>opening_price_eur</th>\n",
+       "      <th>closing_price_eur</th>\n",
+       "      <th>mimimum_price_eur</th>\n",
+       "      <th>maximum_price_eur</th>\n",
+       "      <th>daily_traded_volume</th>\n",
+       "      <th>change_in_closing_in_%</th>\n",
+       "    </tr>\n",
+       "  </thead>\n",
+       "  <tbody>\n",
+       "    <tr>\n",
+       "      <th>0</th>\n",
+       "      <td>AT000000STR1</td>\n",
+       "      <td>2022-12-24</td>\n",
+       "      <td>36.05</td>\n",
+       "      <td>36.10</td>\n",
+       "      <td>35.65</td>\n",
+       "      <td>37.05</td>\n",
+       "      <td>1838</td>\n",
+       "      <td>NaN</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>1</th>\n",
+       "      <td>AT000000STR1</td>\n",
+       "      <td>2022-12-25</td>\n",
+       "      <td>36.10</td>\n",
+       "      <td>37.70</td>\n",
+       "      <td>36.10</td>\n",
+       "      <td>37.70</td>\n",
+       "      <td>2864</td>\n",
+       "      <td>4.43</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>2</th>\n",
+       "      <td>AT000000STR1</td>\n",
+       "      <td>2022-12-26</td>\n",
+       "      <td>36.10</td>\n",
+       "      <td>37.70</td>\n",
+       "      <td>36.10</td>\n",
+       "      <td>37.70</td>\n",
+       "      <td>2864</td>\n",
+       "      <td>0.00</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>3</th>\n",
+       "      <td>AT000000STR1</td>\n",
+       "      <td>2022-12-27</td>\n",
+       "      <td>36.10</td>\n",
+       "      <td>37.70</td>\n",
+       "      <td>36.10</td>\n",
+       "      <td>37.70</td>\n",
+       "      <td>2864</td>\n",
+       "      <td>0.00</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>4</th>\n",
+       "      <td>AT000000STR1</td>\n",
+       "      <td>2022-12-28</td>\n",
+       "      <td>36.60</td>\n",
+       "      <td>36.70</td>\n",
+       "      <td>35.75</td>\n",
+       "      <td>36.70</td>\n",
+       "      <td>1773</td>\n",
+       "      <td>-2.65</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>5</th>\n",
+       "      <td>AT000000STR1</td>\n",
+       "      <td>2022-12-29</td>\n",
+       "      <td>36.60</td>\n",
+       "      <td>36.70</td>\n",
+       "      <td>35.75</td>\n",
+       "      <td>36.70</td>\n",
+       "      <td>1773</td>\n",
+       "      <td>0.00</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>6</th>\n",
+       "      <td>AT000000STR1</td>\n",
+       "      <td>2022-12-30</td>\n",
+       "      <td>36.60</td>\n",
+       "      <td>36.70</td>\n",
+       "      <td>35.75</td>\n",
+       "      <td>36.70</td>\n",
+       "      <td>1773</td>\n",
+       "      <td>0.00</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>7</th>\n",
+       "      <td>AT000000STR1</td>\n",
+       "      <td>2022-12-31</td>\n",
+       "      <td>36.60</td>\n",
+       "      <td>36.70</td>\n",
+       "      <td>35.75</td>\n",
+       "      <td>36.70</td>\n",
+       "      <td>1773</td>\n",
+       "      <td>0.00</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>8</th>\n",
+       "      <td>AT00000FACC2</td>\n",
+       "      <td>2022-12-24</td>\n",
+       "      <td>7.94</td>\n",
+       "      <td>7.96</td>\n",
+       "      <td>7.73</td>\n",
+       "      <td>7.96</td>\n",
+       "      <td>2785</td>\n",
+       "      <td>NaN</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>9</th>\n",
+       "      <td>AT00000FACC2</td>\n",
+       "      <td>2022-12-25</td>\n",
+       "      <td>7.90</td>\n",
+       "      <td>8.36</td>\n",
+       "      <td>7.86</td>\n",
+       "      <td>8.36</td>\n",
+       "      <td>2490</td>\n",
+       "      <td>5.03</td>\n",
+       "    </tr>\n",
+       "  </tbody>\n",
+       "</table>\n",
+       "</div>"
+      ],
+      "text/plain": [
+       "           ISIN        Date  opening_price_eur  closing_price_eur  \\\n",
+       "0  AT000000STR1  2022-12-24              36.05              36.10   \n",
+       "1  AT000000STR1  2022-12-25              36.10              37.70   \n",
+       "2  AT000000STR1  2022-12-26              36.10              37.70   \n",
+       "3  AT000000STR1  2022-12-27              36.10              37.70   \n",
+       "4  AT000000STR1  2022-12-28              36.60              36.70   \n",
+       "5  AT000000STR1  2022-12-29              36.60              36.70   \n",
+       "6  AT000000STR1  2022-12-30              36.60              36.70   \n",
+       "7  AT000000STR1  2022-12-31              36.60              36.70   \n",
+       "8  AT00000FACC2  2022-12-24               7.94               7.96   \n",
+       "9  AT00000FACC2  2022-12-25               7.90               8.36   \n",
+       "\n",
+       "   mimimum_price_eur  maximum_price_eur daily_traded_volume  \\\n",
+       "0              35.65              37.05                1838   \n",
+       "1              36.10              37.70                2864   \n",
+       "2              36.10              37.70                2864   \n",
+       "3              36.10              37.70                2864   \n",
+       "4              35.75              36.70                1773   \n",
+       "5              35.75              36.70                1773   \n",
+       "6              35.75              36.70                1773   \n",
+       "7              35.75              36.70                1773   \n",
+       "8               7.73               7.96                2785   \n",
+       "9               7.86               8.36                2490   \n",
+       "\n",
+       "   change_in_closing_in_%  \n",
+       "0                     NaN  \n",
+       "1                    4.43  \n",
+       "2                    0.00  \n",
+       "3                    0.00  \n",
+       "4                   -2.65  \n",
+       "5                    0.00  \n",
+       "6                    0.00  \n",
+       "7                    0.00  \n",
+       "8                     NaN  \n",
+       "9                    5.03  "
+      ]
+     },
+     "execution_count": 43,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "# creating a new column previous_closiong_price and assigning the value of closing_price_eur column of previous day\n",
+    "df_merged['previous_closing_price'] = df_merged.sort_values(['Date']).groupby(['ISIN'])['closing_price_eur'].shift(1)\n",
+    "\n",
+    "# Calculating precent change from previous day's closing price\n",
+    "df_merged['change_in_closing_in_%'] = round((df_merged['closing_price_eur'] - df_merged['previous_closing_price'])/df_merged['previous_closing_price']*100,2)\n",
+    "\n",
+    "# Dropping column previous_closing_price as it is no longer needed\n",
+    "df_merged.drop(columns = ['previous_closing_price'], inplace = True)\n",
+    "\n",
+    "# Lets round every number to upto two decimals\n",
+    "df_merged = df_merged.round(decimals = 2)\n",
+    "df_merged.head(10)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "76c4ca79-a7b4-4e0d-a769-a992d316a93e",
+   "metadata": {},
+   "source": [
+    "### Write the combined and aggregated dataset to a target S3 Bucket"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 31,
+   "id": "c3afabbe-d181-447a-a81d-39f413c1821f",
+   "metadata": {},
+   "outputs": [
+    {
+     "data": {
+      "text/plain": [
+       "s3.Object(bucket_name='xetra-1234-etl-target-bucket', key='xetra_daily_report20231023_100331.parquet')"
+      ]
+     },
+     "execution_count": 31,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "# Creating an in-memory buffer using BytesIO\n",
+    "out_buffer = BytesIO()\n",
+    "\n",
+    "# Writing the DataFrame (df_merged) to the in-memory buffer in Parquet format\n",
+    "# with index=False (no index column in the Parquet file)\n",
+    "df_merged.to_parquet(out_buffer, index=False)\n",
+    "\n",
+    "# Creating an S3 bucket object by specifying the bucket name\n",
+    "bucket_target = s3.Bucket(trg_bucket)\n",
+    "\n",
+    "# Uploading the Parquet data (from the in-memory buffer) to the S3 bucket\n",
+    "# by getting the buffer's content with getvalue() and specifying the key\n",
+    "bucket_target.put_object(Body=out_buffer.getvalue(), Key=key)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "654f9a34-5384-4462-8f6a-56b5d09075fc",
+   "metadata": {},
+   "source": [
+    "### Reading the uploaded file to check whether the file content is correct"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 32,
+   "id": "e74d546b-b8ec-4645-bf17-45746bb7d250",
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "xetra_daily_report20231022_204256.parquet\n",
+      "xetra_daily_report20231023_100331.parquet\n"
+     ]
+    }
+   ],
+   "source": [
+    "# reading the name of parquet file from S3 bucket\n",
+    "for obj in bucket_target.objects.all():\n",
+    "    print (obj.key)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 33,
+   "id": "dc37a277-5a79-4b7e-bf24-1da98d5aff07",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# Getting the S3 object ('prq_obj') from the specified S3 bucket ('bucket_target')\n",
+    "# The object key is set to 'xetra_daily_report20231022_204256.parquet'\n",
+    "# The object is retrieved from S3 and its body is read as bytes\n",
+    "prq_obj = bucket_target.Object(key='xetra_daily_report20231022_204256.parquet').get().get('Body').read()\n",
+    "\n",
+    "# Create a BytesIO object ('data') and load the Parquet data ('prq_obj') into it\n",
+    "data = BytesIO(prq_obj)\n",
+    "\n",
+    "# Read the Parquet data from the BytesIO object into a pandas DataFrame ('df_report')\n",
+    "df_report = pd.read_parquet(data)\n"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 34,
+   "id": "2666d2f3-a4b2-4278-b968-52a28dcc868d",
+   "metadata": {},
+   "outputs": [
+    {
+     "data": {
+      "text/html": [
+       "<div>\n",
+       "<style scoped>\n",
+       "    .dataframe tbody tr th:only-of-type {\n",
+       "        vertical-align: middle;\n",
+       "    }\n",
+       "\n",
+       "    .dataframe tbody tr th {\n",
+       "        vertical-align: top;\n",
+       "    }\n",
+       "\n",
+       "    .dataframe thead th {\n",
+       "        text-align: right;\n",
+       "    }\n",
+       "</style>\n",
+       "<table border=\"1\" class=\"dataframe\">\n",
+       "  <thead>\n",
+       "    <tr style=\"text-align: right;\">\n",
+       "      <th></th>\n",
+       "      <th>ISIN</th>\n",
+       "      <th>Date</th>\n",
+       "      <th>opening_price_eur</th>\n",
+       "      <th>closing_price_eur</th>\n",
+       "      <th>mimimum_price_eur</th>\n",
+       "      <th>maximum_price_eur</th>\n",
+       "      <th>daily_traded_volume</th>\n",
+       "      <th>change_in_closing_in_%</th>\n",
+       "    </tr>\n",
+       "  </thead>\n",
+       "  <tbody>\n",
+       "    <tr>\n",
+       "      <th>0</th>\n",
+       "      <td>AT000000STR1</td>\n",
+       "      <td>2022-12-24</td>\n",
+       "      <td>36.05</td>\n",
+       "      <td>36.10</td>\n",
+       "      <td>35.65</td>\n",
+       "      <td>37.05</td>\n",
+       "      <td>1838</td>\n",
+       "      <td>NaN</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>1</th>\n",
+       "      <td>AT000000STR1</td>\n",
+       "      <td>2022-12-25</td>\n",
+       "      <td>36.10</td>\n",
+       "      <td>37.70</td>\n",
+       "      <td>36.10</td>\n",
+       "      <td>37.70</td>\n",
+       "      <td>2864</td>\n",
+       "      <td>4.43</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>2</th>\n",
+       "      <td>AT000000STR1</td>\n",
+       "      <td>2022-12-26</td>\n",
+       "      <td>36.10</td>\n",
+       "      <td>37.70</td>\n",
+       "      <td>36.10</td>\n",
+       "      <td>37.70</td>\n",
+       "      <td>2864</td>\n",
+       "      <td>0.00</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>3</th>\n",
+       "      <td>AT000000STR1</td>\n",
+       "      <td>2022-12-27</td>\n",
+       "      <td>36.10</td>\n",
+       "      <td>37.70</td>\n",
+       "      <td>36.10</td>\n",
+       "      <td>37.70</td>\n",
+       "      <td>2864</td>\n",
+       "      <td>0.00</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>4</th>\n",
+       "      <td>AT000000STR1</td>\n",
+       "      <td>2022-12-28</td>\n",
+       "      <td>36.60</td>\n",
+       "      <td>36.70</td>\n",
+       "      <td>35.75</td>\n",
+       "      <td>36.70</td>\n",
+       "      <td>1773</td>\n",
+       "      <td>-2.65</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>...</th>\n",
+       "      <td>...</td>\n",
+       "      <td>...</td>\n",
+       "      <td>...</td>\n",
+       "      <td>...</td>\n",
+       "      <td>...</td>\n",
+       "      <td>...</td>\n",
+       "      <td>...</td>\n",
+       "      <td>...</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>25613</th>\n",
+       "      <td>XS2434891219</td>\n",
+       "      <td>2022-12-27</td>\n",
+       "      <td>3.44</td>\n",
+       "      <td>3.50</td>\n",
+       "      <td>3.44</td>\n",
+       "      <td>3.50</td>\n",
+       "      <td>0</td>\n",
+       "      <td>0.00</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>25614</th>\n",
+       "      <td>XS2434891219</td>\n",
+       "      <td>2022-12-28</td>\n",
+       "      <td>3.44</td>\n",
+       "      <td>3.66</td>\n",
+       "      <td>3.42</td>\n",
+       "      <td>3.66</td>\n",
+       "      <td>0</td>\n",
+       "      <td>4.53</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>25615</th>\n",
+       "      <td>XS2434891219</td>\n",
+       "      <td>2022-12-29</td>\n",
+       "      <td>3.44</td>\n",
+       "      <td>3.66</td>\n",
+       "      <td>3.42</td>\n",
+       "      <td>3.66</td>\n",
+       "      <td>0</td>\n",
+       "      <td>0.00</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>25616</th>\n",
+       "      <td>XS2434891219</td>\n",
+       "      <td>2022-12-30</td>\n",
+       "      <td>3.44</td>\n",
+       "      <td>3.66</td>\n",
+       "      <td>3.42</td>\n",
+       "      <td>3.66</td>\n",
+       "      <td>0</td>\n",
+       "      <td>0.00</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>25617</th>\n",
+       "      <td>XS2434891219</td>\n",
+       "      <td>2022-12-31</td>\n",
+       "      <td>3.44</td>\n",
+       "      <td>3.66</td>\n",
+       "      <td>3.42</td>\n",
+       "      <td>3.66</td>\n",
+       "      <td>0</td>\n",
+       "      <td>0.00</td>\n",
+       "    </tr>\n",
+       "  </tbody>\n",
+       "</table>\n",
+       "<p>25618 rows × 8 columns</p>\n",
+       "</div>"
+      ],
+      "text/plain": [
+       "               ISIN        Date  opening_price_eur  closing_price_eur  \\\n",
+       "0      AT000000STR1  2022-12-24              36.05              36.10   \n",
+       "1      AT000000STR1  2022-12-25              36.10              37.70   \n",
+       "2      AT000000STR1  2022-12-26              36.10              37.70   \n",
+       "3      AT000000STR1  2022-12-27              36.10              37.70   \n",
+       "4      AT000000STR1  2022-12-28              36.60              36.70   \n",
+       "...             ...         ...                ...                ...   \n",
+       "25613  XS2434891219  2022-12-27               3.44               3.50   \n",
+       "25614  XS2434891219  2022-12-28               3.44               3.66   \n",
+       "25615  XS2434891219  2022-12-29               3.44               3.66   \n",
+       "25616  XS2434891219  2022-12-30               3.44               3.66   \n",
+       "25617  XS2434891219  2022-12-31               3.44               3.66   \n",
+       "\n",
+       "       mimimum_price_eur  maximum_price_eur  daily_traded_volume  \\\n",
+       "0                  35.65              37.05                 1838   \n",
+       "1                  36.10              37.70                 2864   \n",
+       "2                  36.10              37.70                 2864   \n",
+       "3                  36.10              37.70                 2864   \n",
+       "4                  35.75              36.70                 1773   \n",
+       "...                  ...                ...                  ...   \n",
+       "25613               3.44               3.50                    0   \n",
+       "25614               3.42               3.66                    0   \n",
+       "25615               3.42               3.66                    0   \n",
+       "25616               3.42               3.66                    0   \n",
+       "25617               3.42               3.66                    0   \n",
+       "\n",
+       "       change_in_closing_in_%  \n",
+       "0                         NaN  \n",
+       "1                        4.43  \n",
+       "2                        0.00  \n",
+       "3                        0.00  \n",
+       "4                       -2.65  \n",
+       "...                       ...  \n",
+       "25613                    0.00  \n",
+       "25614                    4.53  \n",
+       "25615                    0.00  \n",
+       "25616                    0.00  \n",
+       "25617                    0.00  \n",
+       "\n",
+       "[25618 rows x 8 columns]"
+      ]
+     },
+     "execution_count": 34,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "# Uploaded data content is filfilling the business needs\n",
+    "df_report"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "90f89b0b-7f4d-421a-aab5-f2c6d1079eee",
+   "metadata": {},
+   "outputs": [],
+   "source": []
+  }
+ ],
+ "metadata": {
+  "kernelspec": {
+   "display_name": "Python 3 (ipykernel)",
+   "language": "python",
+   "name": "python3"
+  },
+  "language_info": {
+   "codemirror_mode": {
+    "name": "ipython",
+    "version": 3
+   },
+   "file_extension": ".py",
+   "mimetype": "text/x-python",
+   "name": "python",
+   "nbconvert_exporter": "python",
+   "pygments_lexer": "ipython3",
+   "version": "3.9.5"
+  }
+ },
+ "nbformat": 4,
+ "nbformat_minor": 5
+}
